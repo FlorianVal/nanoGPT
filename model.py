@@ -335,3 +335,46 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+class BranchyGPT(GPT):
+    def __init__(self, config):
+        super().__init__(config)
+        self.transformer["aux_head"] = nn.ModuleList([nn.Linear(config.n_embd, config.vocab_size) for _ in range(config.n_layer - 1)])
+        
+    def forward(self, idx, targets=None):
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.config.block_size, "Cannot forward, model block size is exhausted."
+        pos = torch.arange(t, dtype=torch.long, device=device).unsqueeze(0)
+        
+        
+         # forward the GPT model itself
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
+        x = self.transformer.drop(tok_emb + pos_emb)
+        
+        auxiliary_outputs = []
+        
+        for i in range(self.config.n_layer):
+            x = self.transformer.h[i](x)
+            # if last index do not calculate auxiliary output
+            if i != self.config.n_layer - 1:
+                auxiliary_outputs.append(self.transformer.aux_head[i](x).unsqueeze(0))
+            
+        auxiliary_outputs = torch.cat(auxiliary_outputs, dim=0)
+                
+        x = self.transformer.ln_f(x)
+        
+        if targets is not None:
+            # if we are given some desired targets also calculate the loss
+            logits = self.lm_head(x)
+            outputs = torch.cat((auxiliary_outputs, logits.unsqueeze(0)), dim=0)
+            # stack auxiliary outputs and logits
+            
+            loss = F.cross_entropy(outputs.view(-1, logits.size(-1)), targets.view(-1).repeat(outputs.shape[0]), ignore_index=-1)
+        else:
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            loss = None
+
+        return logits, loss
