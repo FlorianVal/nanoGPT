@@ -368,13 +368,50 @@ class BranchyGPT(GPT):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
+            #loss = F.cross_entropy(outputs.view(-1, outputs.size(-1)), targets.view(-1), ignore_index=-1)
+
             outputs = torch.cat((auxiliary_outputs, logits.unsqueeze(0)), dim=0)
-            # stack auxiliary outputs and logits
-            
-            loss = F.cross_entropy(outputs.view(-1, logits.size(-1)), targets.view(-1).repeat(outputs.shape[0]), ignore_index=-1)
+
+            loss = F.cross_entropy(outputs.view(-1, outputs.size(-1)), targets.repeat(outputs.size(0), 1).view(-1), ignore_index=-1, reduction='none')
+            loss = loss.view(self.config.n_layer, -1).mean(dim=-1)
+            #loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            outputs = torch.cat((auxiliary_outputs[:, :, [-1], :], logits.unsqueeze(0)), dim=0)
             loss = None
 
-        return logits, loss
+        return outputs, loss
+    
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        """
+        for _ in range(max_new_tokens):
+            # if the sequence context is growing too long we must crop it at block_size
+            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            # forward the model to get the logits for the index in the sequence
+            logits, _ = self(idx_cond)
+            # pluck the logits at the final step and scale by desired temperature
+            logits = logits[:, :, -1, :] / temperature
+            # optionally crop the logits to only the top k options
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            # apply softmax to convert logits to (normalized) probabilities
+            probs = F.softmax(logits, dim=-1)
+            # sample from the distribution
+            head = -1
+            heads_outputs = []
+            for proba_head in probs:
+                print(torch.topk(proba_head, 5).indices)
+                heads_outputs.append(torch.multinomial(proba_head, num_samples=1).item())
+            print(heads_outputs)
+            idx_next = torch.multinomial(probs[head], num_samples=1)
+            # append sampled index to the running sequence and continue
+            idx = torch.cat((idx, idx_next), dim=1)
+        
+        return idx
