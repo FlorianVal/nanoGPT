@@ -241,6 +241,7 @@ if block_size < model.config.block_size:
         "block_size"
     ] = block_size  # so that the checkpoint will have the right value
 model.to(device)
+print(f"Device : {device}")
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
@@ -362,10 +363,12 @@ while True:
                     checkpoint, os.path.join(out_dir, "ckpt_" + wandb_run_name + ".pt")
                 )
                 if branchy:
+                    print(f"Saving reject option at iter {iter_num}")
+                    model.eval()
                     reject_option.calibrate(
                         calib_data, block_size, batch_size, model=model
                     )
-
+                    reject_option.eval_reject_option(model, val_data, block_size=block_size, out_dir=out_dir, plot_tag=str(iter_num))
                     reject_option.to_file(
                         os.path.join(out_dir, "reject_option_" + wandb_run_name + ".pt")
                     )
