@@ -6,4 +6,4 @@ data/*
 .vscode/
 wandb/
 out-shakespeare-char/
-
+*.csv
