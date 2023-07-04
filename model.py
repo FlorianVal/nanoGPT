@@ -9,6 +9,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 import math
 import inspect
+import pandas as pd
 from dataclasses import dataclass
 
 import torch
@@ -384,12 +385,17 @@ class BranchyGPT(GPT):
         return outputs, loss
     
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, reject_option, temperature=1.0, top_k=None, epsilon=0.9, decoder=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
+        epsilon = torch.tensor(epsilon)
+        selected_heads = []
+        
+        df = pd.DataFrame(columns=['head', 'token', 'decoded_token'])
+        
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
@@ -397,21 +403,27 @@ class BranchyGPT(GPT):
             logits, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, :, -1, :] / temperature
+            
+            logits = F.softmax(logits, dim=-1)
             # optionally crop the logits to only the top k options
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
+                logits[logits < v[:, :, [-1]]] = 0
             # sample from the distribution
-            head = -1
-            heads_outputs = []
-            for proba_head in probs:
-                print(torch.topk(proba_head, 5).indices)
-                heads_outputs.append(torch.multinomial(proba_head, num_samples=1).item())
-            print(heads_outputs)
-            idx_next = torch.multinomial(probs[head], num_samples=1)
+            for head, proba_head in enumerate(logits):
+                if not reject_option.is_rejected(proba_head, epsilon=epsilon, head=head) or head == len(logits) - 1:
+                    selected_heads.append(head)
+                    #print(f"Selecting head {head} with probability {reject_option.apply_type(proba_head, reject_option.metric_type).values}")
+                    break
+            idx_next = torch.multinomial(proba_head, num_samples=1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
-        
+            if decoder is not None:
+                # report in a pandas dataframe: token, token decoded, head chosen, probability of each head
+                decoded_token = decoder([idx_next.item()])
+                probs = {f'head_{i}': logits[i].tolist() for i in range(len(logits))}
+                df = pd.concat([df, pd.DataFrame({'head': head, 'token': idx_next.item(), 'decoded_token': decoded_token, **probs})])
+                    
+        df.to_csv(f'results{epsilon}.csv')
+        print(f"Selected heads: {selected_heads}")
         return idx
