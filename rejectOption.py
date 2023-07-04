@@ -1,9 +1,12 @@
 import numpy as np
 import torch
+import os
+
+from torch.nn import functional as F
 from loguru import logger
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-
+from matplotlib import pyplot as plt
 
 def get_device():
     """Get the device to use for the reject option
@@ -11,7 +14,13 @@ def get_device():
     Returns:
         torch.device: device to use
     """
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    elif torch.backends.mps.is_available():
+        device = torch.device('mps')
+    else:
+        device = torch.device('cpu')
+    return device
 
 
 class RejectOption:
@@ -149,7 +158,7 @@ class RejectOption:
             metric_type (str): type of metric to use. Defaults to "max". Possible values : ["max", "max_2_diff", "simple_threshold"]
         """
         self.calibration_set = torch.cat(
-            (self.calibration_set, self.apply_type(logits, metric_type).detach().cpu()), -1
+            (self.calibration_set, self.apply_type(logits, metric_type).values.detach().cpu()), -1
         ).detach().cpu()
         assert (
             len(self.calibration_set.shape) == 2
@@ -182,7 +191,7 @@ class RejectOption:
             return torch.max(
                 torch.sub(topk_tensor[..., 0], topk_tensor[..., 1]).unsqueeze(-1),
                 dim=-1,
-            ).values
+            )
         else:
             raise ValueError(f"Type {type} not supported")
 
@@ -210,9 +219,7 @@ class RejectOption:
 
             is_rejected = criterion.values < torch.tensor(epsilon)
             return is_rejected.to("cpu")
-
         logits, _ = self.apply_type(logits, self.metric_type)
-
         # if repartition is not provided, use the calibration set and select the correct repartition from every head
         if repartition.shape[0] == 0 and head is not None:
             repartition = self.calibration_set[:, head]
@@ -229,15 +236,15 @@ class RejectOption:
             raise ValueError(
                 "repartition is empty and calibration set is empty, looks like reject Option wasn't calibrated"
             )
-        logger.debug(
-            f"Doing is rejected with repartition {repartition.shape} for {logits.shape}"
-        )
-        index = torch.searchsorted(torch.sort(repartition).values, logits).cpu()
+        try:
+            index = torch.searchsorted(torch.sort(repartition).values, logits).cpu()
+        except NotImplementedError:
+            # not implemented on mps backend so falling back to cpu
+            index = torch.searchsorted(torch.sort(repartition).values.cpu(), logits.cpu())
         index = torch.clamp(index, 0, len(repartition) - 1)
         is_rejected = torch.linspace(0, 1, len(repartition) + 1)[index] < epsilon.cpu()
 
         return is_rejected
-
 
 class LLMRejectOption(RejectOption):
     """RejectOption implemented specifically for NanoGPT LLM model (really specific implementation)."""
@@ -324,6 +331,9 @@ class LLMRejectOption(RejectOption):
 
         model.eval()
 
+        self.calibration_set = torch.empty(0)
+
+
         if max_calibration_size > len(data) - block_size:
             logger.warning(
                 f"max_calibration_size is bigger than the dataset size, reducing it to {len(data) - block_size}"
@@ -334,7 +344,59 @@ class LLMRejectOption(RejectOption):
             X, Y = self.get_batch(data, batch_size, block_size, self.device)
 
             logits, _ = model(X, Y)
-
+            logits = F.softmax(logits, dim=-1)
             last_word_logit = logits[:, :, -1, :]
             self.add_to_repartition_function(last_word_logit, self.metric_type)
-            
+
+    def eval_reject_option(self,
+                           model: torch.nn.Module,
+                           dataset: torch.utils.data.Dataset,
+                           sampling: int = 10,
+                           min_epsilon: float = 0.,
+                           max_epsilon: float = 1.,
+                           block_size: int = 512,
+                           out_dir: str = "./",
+                           plot_tag: str = "0",
+                           eval_iters: int = 200):
+        """evaluate the reject option on a dataset by using reject option on it while varying epsilon. create a plot of the results.
+        
+        Args:
+            model (torch.nn.Module): model to calibrate
+            dataset (torch.utils.data.Dataset): dataset to calibrate on
+            sampling (int, optional): number of samples to use for the evaluation. Defaults to 10.
+            min_epsilon (float, optional): minimum epsilon to use. Defaults to 0.
+            max_epsilon (float, optional): maximum epsilon to use. Defaults to 1.
+            out_dir (str, optional): directory to save the plot. Defaults to "./".
+            plot_tag (str, optional): tag to use for the plot. Defaults to "0".
+        """
+        # TODO Use exponential weights aggregation
+        
+        # fix epsilon, iter on dataset, for each data point, calculate output based on reject option. save head and calculate loss. Plot epsilon/loss
+        # TODO add thop to plot power usage/loss
+        model.eval()
+        out = {}
+        losses = []
+        # TODO better compute perplexity here instead of using the loss
+        for epsilon in torch.linspace(min_epsilon, max_epsilon, sampling):
+            # print log every 1/4 of the sampling
+            if len(out) % (sampling // 4) == 0:
+                print(f"evaluated {len(out)} epsilons")
+            losses = torch.zeros(eval_iters)
+            for k in range(eval_iters):
+                X, Y = self.get_batch(dataset, 1, block_size, self.device)
+                logits, loss = model(X, Y)
+                logits = logits[:, :, -1, :]
+                for head, proba_head in enumerate(logits):
+                    if not self.is_rejected(proba_head, epsilon=epsilon, head=head):
+                        break
+                losses[k] = torch.exp(loss[head]).item()
+            out[epsilon] = losses.mean()
+
+        # plot and save epsilon/loss
+        plt.plot(list(out.keys()), list(out.values()))
+        plt.xlabel("epsilon")
+        plt.ylabel("loss")
+        plt.savefig(os.path.join(out_dir, f"loss_{plot_tag}.png"))
+        plt.close()
+        
+        model.train()
