@@ -1,4 +1,4 @@
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Dict
 
 import torch
 import torch.nn.functional as F
@@ -65,19 +65,30 @@ class BranchyLlama(LlamaPreTrainedModel):
         self,
         aux_logits: torch.Tensor,
         lm_logits: torch.Tensor,
-    ) -> torch.FloatTensor:
+        return_per_head: bool = False,
+    ) -> Dict[str, torch.Tensor]:
         last_aux_logits = aux_logits[..., -1, :]
         last_lm_logits = lm_logits[..., -1, :]
 
         last_lm_logits = last_lm_logits.repeat(last_aux_logits.shape[0], 1, 1, 1)
+        losses = []
+        if return_per_head:
+            for head_logit in last_aux_logits:
+                losses.append(
+                    nn.KLDivLoss(reduction="batchmean")(
+                        F.log_softmax(head_logit, dim=-1),
+                        F.softmax(last_lm_logits[0], dim=-1),
+                    )
+                )
+            loss = torch.stack(losses, dim=0).mean(dim=-1)
+        else:
+            # Compute the KL divergence between the last auxiliary head and the last LM head
+            loss = nn.KLDivLoss(reduction="batchmean")(
+                F.log_softmax(last_aux_logits.view(-1, self.config.vocab_size), dim=-1),
+                F.softmax(last_lm_logits.view(-1, self.config.vocab_size), dim=-1),
+            )
 
-        # Compute the KL divergence between the last auxiliary head and the last LM head
-        loss = nn.KLDivLoss(reduction="batchmean")(
-            F.log_softmax(last_aux_logits.view(-1, self.config.vocab_size), dim=-1),
-            F.softmax(last_lm_logits.view(-1, self.config.vocab_size), dim=-1),
-        )
-
-        return loss
+        return {"loss": loss, "aux_loss": torch.stack(losses)}
 
     def forward(
         self,
@@ -170,6 +181,8 @@ class BranchyLlama(LlamaPreTrainedModel):
         if self_supervision:
             # Compute the loss to train the auxiliary heads
             loss = self.compute_self_supervision_loss(aux_logits, lm_logits)
+            loss = loss["loss"]
+            aux_loss = loss["aux_loss"]
         if not return_dict:
             output = (logits,) + outputs[1:]
             return ((loss,) + output) if loss is not None else output
