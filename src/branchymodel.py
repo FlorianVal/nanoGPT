@@ -87,9 +87,10 @@ class BranchyLlama(LlamaPreTrainedModel):
                 F.log_softmax(last_aux_logits.view(-1, self.config.vocab_size), dim=-1),
                 F.softmax(last_lm_logits.view(-1, self.config.vocab_size), dim=-1),
             )
-
-        return {"loss": loss, "aux_loss": torch.stack(losses)}
-
+        if return_per_head:
+            return {"loss": loss, "aux_loss": torch.stack(losses)}
+        else:
+            return {"loss": loss, "aux_loss": None}
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -104,7 +105,6 @@ class BranchyLlama(LlamaPreTrainedModel):
         return_dict: Optional[bool] = None,
         self_supervision: Optional[bool] = True,
     ) -> Union[Tuple, CausalBranchyLLMOutputWithPast]:
-        print(self_supervision)
         output_attentions = (
             output_attentions
             if output_attentions is not None
@@ -180,9 +180,10 @@ class BranchyLlama(LlamaPreTrainedModel):
             loss = torch.stack([aux_loss, lm_loss], dim=0)
         if self_supervision:
             # Compute the loss to train the auxiliary heads
-            loss = self.compute_self_supervision_loss(aux_logits, lm_logits)
-            loss = loss["loss"]
-            aux_loss = loss["aux_loss"]
+            losses = self.compute_self_supervision_loss(aux_logits, lm_logits, return_per_head=True)
+            loss = losses["loss"]
+            if losses["aux_loss"] is not None:
+                aux_loss = losses["aux_loss"]
         if not return_dict:
             output = (logits,) + outputs[1:]
             return ((loss,) + output) if loss is not None else output

@@ -27,7 +27,16 @@ class RandomIntDataset(Dataset):
 def create_dataloader(vocab_size, batch_size=8):
     return DataLoader(RandomIntDataset(vocab_size), batch_size=batch_size)
 
-def training_loop(model):
+branchyllamaconf = BranchyLlama.config_class.from_pretrained(
+    "openlm-research/open_llama_3b_v2"
+)
+branchyllamaconf.self_supervision = True
+branchyllamaconf.num_hidden_layers = 2
+model = BranchyLlama.from_pretrained(
+    "openlm-research/open_llama_3b_v2", config=branchyllamaconf
+)
+
+def training_loop():
     
     accelerator = Accelerator()
     
@@ -103,14 +112,11 @@ hyperparameters = {
     "vocab_size": 32000,
 }
 
-if __name__ == "__main__":
-    branchyllamaconf = BranchyLlama.config_class.from_pretrained(
-        "openlm-research/open_llama_3b_v2"
-    )
-    branchyllamaconf.self_supervision = True
+branchyllamaconf = BranchyLlama.config_class.from_pretrained(
+    "openlm-research/open_llama_3b_v2"
+)
+branchyllamaconf.self_supervision = True
 
-    model = BranchyLlama.from_pretrained(
-        "openlm-research/open_llama_3b_v2", config=branchyllamaconf
-    )
-    
-    training_loop(model)
+model = BranchyLlama.from_pretrained(
+    "openlm-research/open_llama_3b_v2", config=branchyllamaconf
+)
